@@ -52,14 +52,10 @@ python main.py
 ## 贡献
 欢迎提交问题和建议！如果你有任何改进意见，请创建一个issue或pull request。
 
-## 许可证
-本项目采用MIT许可证。详细内容请参见[LICENSE](LICENSE)文件。
-
 ## 目录结构
 ```
 remote_ppg_blood_pressure/
 ├── README.md
-├── LICENSE
 ├── haarcascade_frontalface_default.xml
 └── main.py
 ```
