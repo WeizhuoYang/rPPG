@@ -4,8 +4,9 @@ import time
 import logging
 import numpy as np
 import matplotlib.pyplot as plt
+from sklearn.cluster import KMeans
 from scipy.signal import butter, filtfilt
-
+import pywt
 # 配置日志记录
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -30,7 +31,7 @@ class RemotePPG:
         self.timestamps = []
 
         # 加载人脸检测器
-        self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        self.face_cascade = cv2.CascadeClassifier('haarcascade_frontalface_default.xml')
 
     def detect_faces(self, frame):
         """
@@ -132,7 +133,7 @@ def butter_bandpass_filter(data, lowcut, highcut, fs, order=5):
     y = filtfilt(b, a, data)
     return y
 
-
+# FFT计算心率
 def calculate_heart_rate(signal, fs):
     # 使用FFT计算频谱
     fft_result = np.fft.fft(signal)
@@ -147,23 +148,47 @@ def calculate_heart_rate(signal, fs):
     return heart_rate
 
 
+def estimate_blood_pressure(rppg_signal):
+    """
+    简单的无监督方法估算血压
+
+    参数:
+        ppg_signal: rPPG信号
+
+    返回:
+        estimated_systolic: 估算的收缩压
+        estimated_diastolic: 估算的舒张压
+    """
+    # 使用KMeans聚类来识别两个主要的心率变化点
+    kmeans = KMeans(n_clusters=2, random_state=42).fit(np.array(rppg_signal).reshape(-1, 1))
+    clusters = kmeans.labels_
+
+    # 假设较高的集群是收缩压，较低的是舒张压
+    systolic_cluster = np.max(clusters)
+    diastolic_cluster = np.min(clusters)
+
+    # 计算收缩压和舒张压
+    estimated_systolic = np.mean(rppg_signal[clusters == systolic_cluster])
+    estimated_diastolic = np.mean(rppg_signal[clusters == diastolic_cluster])
+
+    return estimated_systolic, estimated_diastolic
+
 def main():
     # 设置工作目录为脚本所在目录
     script_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(script_dir)
 
     # 直接指定输入和输出路径
-    input_path = "yzw515.mp4"
-    output_path = "processed_yyy.mp4"
+    input_path = 0  # 使用默认摄像头
 
     # 创建RemotePPG对象
-    rppg = RemotePPG(buffer_size=150, sampling_rate=30)
+    rppg = RemotePPG(buffer_size=120, sampling_rate=30)
 
     # 初始化视频捕获
     cap = cv2.VideoCapture(input_path)
 
     if not cap.isOpened():
-        logger.error(f"无法打开视频: {input_path}")
+        logger.error("无法打开摄像头")
         return
 
     # 获取视频参数
@@ -177,91 +202,99 @@ def main():
 
     logger.info(f"视频信息: {frame_width}x{frame_height}, {fps} FPS, {total_frames} 帧")
 
-    # 初始化视频写入器
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    video_writer = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
-
     # 存储RGB值
     forehead_rgb_values = {'R': [], 'G': [], 'B': []}
     cheek_rgb_values = {'R': [], 'G': [], 'B': []}
 
-    try:
-        # 进度跟踪
-        start_time = time.time()
-        frame_idx = 0
+    # 初始化计时器
+    start_time = time.time()
+    frame_idx = 0
+    last_heart_rate = 0
+    last_systolic = 0
+    last_diastolic = 0
+    while True:
+        # 读取一帧
+        ret, frame = cap.read()
 
-        while True:
-            # 读取一帧
-            ret, frame = cap.read()
+        if not ret:
+            break
 
-            if not ret:
-                break
+        frame_idx += 1
 
-            frame_idx += 1
+        # 检测人脸
+        faces = rppg.detect_faces(frame)
 
-            # 检测人脸
-            faces = rppg.detect_faces(frame)
+        # 提取ROI并绘制标记
+        result = rppg.extract_face_roi(frame, faces)
 
-            # 提取ROI并绘制标记
-            result = rppg.extract_face_roi(frame, faces)
+        if result is not None:
+            mean_rgb_forehead = rppg.process_roi(result['forehead'])
+            mean_rgb_cheek = rppg.process_roi(result['cheek'])
 
-            if result is not None:
-                mean_rgb_forehead = rppg.process_roi(result['forehead'])
-                mean_rgb_cheek = rppg.process_roi(result['cheek'])
+            # 存储每一帧的RGB值
+            if mean_rgb_forehead is not None:
+                forehead_rgb_values['R'].append(mean_rgb_forehead[2])  # 红色
+                forehead_rgb_values['G'].append(mean_rgb_forehead[1])  # 绿色
+                forehead_rgb_values['B'].append(mean_rgb_forehead[0])  # 蓝色
 
-                # 打印RGB平均值
-                logger.info(f"Frame {frame_idx}: Forehead RGB: {mean_rgb_forehead}, Cheek RGB: {mean_rgb_cheek}")
+            if mean_rgb_cheek is not None:
+                cheek_rgb_values['R'].append(mean_rgb_cheek[2])  # 红色
+                cheek_rgb_values['G'].append(mean_rgb_cheek[1])  # 绿色
+                cheek_rgb_values['B'].append(mean_rgb_cheek[0])  # 蓝色
 
-                # 将BGR图像转换为RGB以便matplotlib正确显示
-                display_rgb = cv2.cvtColor(result['display'], cv2.COLOR_BGR2RGB)
+            # 滑动窗口计算心率
+            window_size = rppg.buffer_size
+            if len(forehead_rgb_values['G']) >= window_size:
+                green_signal = np.array(forehead_rgb_values['G'][-window_size:])
+                filtered_signal = butter_bandpass_filter(green_signal, 1, 4.0, rppg.fs, order=5)
+                # 小波去噪
+                wavelet = 'sym8'
+                level = 5
+                coeffs = pywt.wavedec(filtered_signal, wavelet, level=level)
+                medians = [np.median(np.abs(c)) for c in coeffs[1:]]
+                threshold = np.median(medians) / 0.6745
+                # threshold = 0.1
+                # denoised_coeffs = [pywt.threshold(c, threshold, mode='soft') for c in coeffs]
+                denoised_coeffs = [coeffs[0]] + [pywt.threshold(c, threshold, mode='soft') for c in coeffs[1:]]
+                wavelet_signal = pywt.waverec(denoised_coeffs, wavelet)
+                last_heart_rate = calculate_heart_rate(wavelet_signal, rppg.fs)
 
-                # 显示结果图像
-                cv2.imshow('处理中...', result['display'])
+                # 估算血压
+                last_systolic, last_diastolic = estimate_blood_pressure(wavelet_signal)
+                logger.info(f"Estimated Systolic BP: {last_systolic:.1f}, Diastolic BP: {last_diastolic:.1f}")
 
-                # 保存结果帧到输出视频
-                video_writer.write(result['display'])
+            # 在帧上显示心率
+            cv2.putText(result['display'], f"Heart Rate: {last_heart_rate:.1f} BPM", (10, 110),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            cv2.putText(result['display'], f"Systolic: {last_systolic:.2f}, Diastolic: {last_diastolic:.2f} ", (10, 150),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            '''
+            # 显示RGB信息
+            if mean_rgb_forehead is not None:
+                cv2.putText(result['display'], f"Forehead RGB: {mean_rgb_forehead}", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+            if mean_rgb_cheek is not None:
+                cv2.putText(result['display'], f"Cheek RGB: {mean_rgb_cheek}", (10, 70),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            '''
+            # 显示结果图像
+            cv2.imshow('实时处理', result['display'])
 
-                # 记录RGB值
-                if mean_rgb_forehead is not None:
-                    forehead_rgb_values['R'].append(mean_rgb_forehead[2])
-                    forehead_rgb_values['G'].append(mean_rgb_forehead[1])
-                    forehead_rgb_values['B'].append(mean_rgb_forehead[0])
+        else:
+            # 如果没有检测到人脸，直接显示原始帧
+            cv2.imshow('实时处理', frame)
 
-                if mean_rgb_cheek is not None:
-                    cheek_rgb_values['R'].append(mean_rgb_cheek[2])
-                    cheek_rgb_values['G'].append(mean_rgb_cheek[1])
-                    cheek_rgb_values['B'].append(mean_rgb_cheek[0])
-            else:
-                # 如果没有检测到人脸，直接保存原帧
-                cv2.imshow('处理中...', frame)
-                video_writer.write(frame)
+        # 按'q'退出
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-            # 显示进度
-            if frame_idx % 30 == 0:
-                elapsed = time.time() - start_time
-                fps_avg = frame_idx / elapsed if elapsed > 0 else 0
-                progress = frame_idx / total_frames * 100 if total_frames > 0 else 0
-                eta = (total_frames - frame_idx) / fps_avg if fps_avg > 0 else 0
+    # 释放资源
+    cap.release()
+    cv2.destroyAllWindows()
 
-                logger.info(f"进度: {progress:.1f}% ({frame_idx}/{total_frames}), "
-                            f"FPS: {fps_avg:.1f}, ETA: {eta:.1f}秒")
+    logger.info(f"视频处理完成，共处理 {frame_idx} 帧")
 
-            # 按'q'退出
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-    finally:
-        cap.release()
-        video_writer.release()
-        cv2.destroyAllWindows()
-
-        logger.info(f"视频处理完成，共处理 {frame_idx} 帧")
-
-        # 绘制RGB变化曲线
-        plot_rgb_changes(forehead_rgb_values, cheek_rgb_values)
-
-        # 计算并绘制BVP信号
-        compute_and_plot_bvp(forehead_rgb_values, fps)
-
+    plot_rgb_changes(forehead_rgb_values, cheek_rgb_values)
 
 def plot_rgb_changes(forehead_rgb_values, cheek_rgb_values):
     """
@@ -298,54 +331,5 @@ def plot_rgb_changes(forehead_rgb_values, cheek_rgb_values):
     plt.tight_layout()
     plt.show()
 
-
-def compute_and_plot_bvp(rgb_values, fs):
-    """
-    计算并绘制BVP信号
-
-    参数:
-        rgb_values: RGB值字典
-        fs: 采样率(Hz)
-    """
-    # 选择绿色通道作为BVP信号
-    green_signal = np.array(rgb_values['G'])
-
-    # 平滑信号
-    lowcut = 1
-    highcut = 4.0
-    filtered_signal = butter_bandpass_filter(green_signal, lowcut, highcut, fs, order=5)
-
-    # 计算心率
-    heart_rate = calculate_heart_rate(filtered_signal, fs)
-    logger.info(f"Estimated Heart Rate: {heart_rate:.1f} BPM")
-    print(f"----HR:{heart_rate}----")
-    # 绘制BVP信号
-    frames = range(len(green_signal))
-
-    plt.figure(figsize=(12, 8))
-
-    # 绘制原始绿色信号
-    plt.subplot(2, 1, 1)
-    plt.plot(frames, green_signal, label='Raw Green Signal', color='green')
-    plt.title('Green Channel Signal Over Time')
-    plt.xlabel('Frame Number')
-    plt.ylabel('Average Green Value')
-    plt.legend()
-
-    # 绘制过滤后的BVP信号
-    plt.subplot(2, 1, 2)
-    plt.plot(frames, filtered_signal, label='Filtered BVP Signal', color='blue')
-    plt.title('Filtered BVP Signal Over Time')
-    plt.xlabel('Frame Number')
-    plt.ylabel('Filtered Green Value')
-    plt.legend()
-
-    plt.tight_layout()
-    plt.show()
-
-
 if __name__ == '__main__':
     main()
-
-
-
