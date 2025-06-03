@@ -59,7 +59,3 @@ remote_ppg_blood_pressure/
 ├── haarcascade_frontalface_default.xml
 └── main.py
 ```
-
----
-
-希望这个README文件适合在GitHub上使用。如果有任何进一步的需求或问题，请随时告知！
